@@ -1,18 +1,24 @@
-import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Token, TokenAmount, Percent } from '@raydium-io/raydium-sdk';
-import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import { createAssociatedTokenAccountIdempotentInstruction, createCloseAccountInstruction, createSyncNativeInstruction, getAccount, getAssociatedTokenAddressSync, MintLayout, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+// External Libraries
 import bs58 from 'bs58';
-import { logger } from '../utils/logger';
-import { COMMITMENT_LEVEL, LOG_LEVEL, PRIVATE_KEY, QUOTE_AMOUNT, QUOTE_MINT, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT } from "../constants";
-import { createPoolKeys, getTokenAccounts } from "../liquidity";
-import { MinimalMarketLayoutV3 } from '../market';
+import { BN } from 'bn.js';
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Token, TokenAmount, Percent } from '@raydium-io/raydium-sdk';
+import { createAssociatedTokenAccountIdempotentInstruction, createCloseAccountInstruction, getAccount, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
-let wallet: Keypair;
-let quoteToken: Token;
+// Internal Modules
+import { logger } from '../utils/logger';
+import { getWallet } from '../utils/wallet';
+import { createAndFundWSOL, checkAuthority } from '../utils/helpers';
+import { createPoolKeys, getTokenAccounts } from '../liquidity';
+import { MinimalMarketLayoutV3 } from '../market';
+import { COMMITMENT_LEVEL, LOG_LEVEL, PRIVATE_KEY, QUOTE_AMOUNT, QUOTE_MINT, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, BUY_SLIPPAGE, TAKE_PROFIT, AMOUNT_TO_WSOL, AUTO_SELL, SELL_TIMER, MAX_RETRY, FREEZE_AUTHORITY, MINT_AUTHORITY, SELL_SLIPPAGE, STOP_LOSS, PRICE_CHECK_INTERVAL, ONE_TOKEN_AT_A_TIME, MAX_NUMBERS_TOKENS_TO_PROCESS } from '../constants';
+
+// Token amount initialization
 let quoteTokenAssociatedAddress: PublicKey;
 let quoteAmount: TokenAmount;
+let quoteToken = Token.WSOL;
 
-wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+// Initialize wallet using PRIVATE_KEY
 quoteAmount = new TokenAmount(Token.WSOL, QUOTE_AMOUNT, false);
 
 export interface MinimalTokenAccountData {
@@ -23,24 +29,17 @@ export interface MinimalTokenAccountData {
 };
 
 const existingTokenAccounts: Map<string, MinimalTokenAccountData> = new Map<string, MinimalTokenAccountData>();
-
-const solanaConnection = new Connection(RPC_ENDPOINT, {
+// Constants
+export const sleep = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+export const wallet = getWallet(PRIVATE_KEY.trim()); // Initialize wallet once
+export const solanaConnection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
 });
-
-// Constants
-const AMOUNT_TO_WSOL = parseFloat(process.env.AMOUNT_TO_WSOL || '0.005');
-const AUTO_SELL = process.env.AUTO_SELL === 'true';
-const SELL_TIMER = parseInt(process.env.SELL_TIMER || '10000', 10);
-const MAX_RETRY = parseInt(process.env.MAX_RETRY || '10', 10);
-const SLIPPAGE = parseFloat(process.env.SLIPPAGE || '0.005');
 
 // Init Function
 export async function init(): Promise<void> {
   logger.level = LOG_LEVEL;
-
-  // Get wallet
-  wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+  
   logger.info(`Wallet Address: ${wallet.publicKey}`);
 
   // Handle quote token based on QUOTE_MINT (WSOL or USDC)
@@ -72,13 +71,25 @@ export async function init(): Promise<void> {
     `Script will buy all new tokens using ${QUOTE_MINT}. Amount that will be used to buy each token is: ${quoteAmount.toFixed().toString()}`
   );
 
-  // Display AUTO_SELL & SELL_TIMER
+  // Trading configurations
   logger.info(`AUTO_SELL: ${AUTO_SELL}`);
-  logger.info(`SELL_TIMER: ${SELL_TIMER}`);
-  logger.info(`SLIPPAGE: ${SLIPPAGE}`);
+  logger.info(`BUY_SLIPPAGE: ${BUY_SLIPPAGE}%`);
+  logger.info(`SELL_SLIPPAGE: ${SELL_SLIPPAGE}%`);
+  logger.info(`STOP_LOSS: ${STOP_LOSS}%`);
+  logger.info(`TAKE_PROFIT: ${TAKE_PROFIT}%`);
+  logger.info(`ONE_TOKEN_AT_A_TIME: ${ONE_TOKEN_AT_A_TIME}`);
+  logger.info(`MAX_NUMBERS_TOKENS_TO_PROCESS: ${MAX_NUMBERS_TOKENS_TO_PROCESS}`);
   logger.info(`AMOUNT_TO_WSOL: ${AMOUNT_TO_WSOL}`);
+  logger.info(`QUOTE_AMOUNT: ${QUOTE_AMOUNT}`);
   logger.info(`MAX_RETRY: ${MAX_RETRY}`);
-  logger.info(`FREEZE_AUTHORITY: ${process.env.FREEZE_AUTHORITY}`);
+
+  // Timers and intervals
+  logger.info(`SELL_TIMER: ${SELL_TIMER}ms`);
+  logger.info(`PRICE_CHECK_INTERVAL: ${PRICE_CHECK_INTERVAL}ms`);
+
+  // Authorities
+  logger.info(`FREEZE_AUTHORITY: ${FREEZE_AUTHORITY}`);
+  logger.info(`MINT_AUTHORITY: ${MINT_AUTHORITY}`);
 
   // Check existing wallet for associated token account of quote mint
   const tokenAccounts = await getTokenAccounts(solanaConnection, wallet.publicKey, COMMITMENT_LEVEL);
@@ -129,68 +140,62 @@ export async function init(): Promise<void> {
   }
 }
 
-// Helper function to create and fund WSOL account
-async function createAndFundWSOL(wsolAta: PublicKey): Promise<void> {
-  // Create WSOL (wrapped SOL) account and fund it
-  const instructions = [
-    createAssociatedTokenAccountIdempotentInstruction(
-      wallet.publicKey,
-      wsolAta,
-      wallet.publicKey,
-      Token.WSOL.mint
-    ),
-    SystemProgram.transfer({
-      fromPubkey: wallet.publicKey,
-      toPubkey: wsolAta,
-      lamports: AMOUNT_TO_WSOL * LAMPORTS_PER_SOL,
-    }),
-    createSyncNativeInstruction(wsolAta), // Sync native to wrap SOL into WSOL
-  ];
 
-  // Prepare message and versioned transaction
-  const latestBlockhash = await solanaConnection.getLatestBlockhash();
-  logger.info('Fetched latest blockhash for transaction.');
-
-  const message = new TransactionMessage({
-    payerKey: wallet.publicKey,
-    recentBlockhash: latestBlockhash.blockhash,
-    instructions: instructions,
-  }).compileToV0Message();
-
-  const versionedTransaction = new VersionedTransaction(message);
-
-  // Sign the transaction
-  versionedTransaction.sign([wallet]);
-
-  // Send the serialized transaction using sendRawTransaction
-  const signature = await solanaConnection.sendRawTransaction(versionedTransaction.serialize(), {
-    skipPreflight: false,
-    preflightCommitment: COMMITMENT_LEVEL,
-  });
-
-  // Confirm transaction with the new `TransactionConfirmationStrategy`
-  const confirmationStrategy = {
-    signature,
-    blockhash: latestBlockhash.blockhash,
-    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-  };
-
-  await solanaConnection.confirmTransaction(confirmationStrategy, COMMITMENT_LEVEL);
-  logger.info(`Created and funded WSOL account with ` + AMOUNT_TO_WSOL + ` SOL. Transaction signature: ${signature}`);
-}
-
-
-// Helper function to check if freeze authority exists
-async function checkFreezeAuthority(mintAddress: PublicKey): Promise<boolean> {
-  const mintAccountInfo = await solanaConnection.getAccountInfo(mintAddress);
-  if (mintAccountInfo && mintAccountInfo.data) {
-    const mintData = MintLayout.decode(mintAccountInfo.data);
-    return mintData.freezeAuthorityOption !== 0;
+const priceMatch = async (poolKeys: LiquidityPoolKeysV4, amountIn: TokenAmount, sellTimer: number) => {
+  if (PRICE_CHECK_INTERVAL === 0) {
+    return true; // Immediately proceed if no interval is set
   }
-  return false;
-}
 
-// Buy Function with Conditional Freeze Authority Check
+  const profitFraction = quoteAmount.mul(TAKE_PROFIT).numerator.div(new BN(100));
+  const profitAmount = new TokenAmount(quoteToken, profitFraction, true);
+  const takeProfit = quoteAmount.add(profitAmount);
+
+  const lossFraction = quoteAmount.mul(STOP_LOSS).numerator.div(new BN(100));
+  const lossAmount = new TokenAmount(quoteToken, lossFraction, true);
+  const stopLoss = quoteAmount.subtract(lossAmount);
+  const slippage = new Percent(SELL_SLIPPAGE, 100);
+
+  let startTime = Date.now();
+
+  // Loop until the SELL_TIMER duration elapses or price conditions are met
+  while (Date.now() - startTime < sellTimer) {
+    try {
+      const poolInfo = await Liquidity.fetchInfo({
+        connection: solanaConnection,
+        poolKeys,
+      });
+
+      const amountOut = Liquidity.computeAmountOut({
+        poolKeys,
+        poolInfo,
+        amountIn: amountIn,
+        currencyOut: quoteToken,
+        slippage,
+      }).amountOut;
+
+      logger.debug(
+        { mint: poolKeys.baseMint.toString() },
+        `Take profit: ${takeProfit.toFixed()} | Stop loss: ${stopLoss.toFixed()} | Current: ${amountOut.toFixed()}`
+      );
+
+      // Check if the price meets the take profit or stop loss conditions
+      if (amountOut.lt(stopLoss) || amountOut.gt(takeProfit)) {
+        return true; // Sell conditions met, proceed to sell
+      }
+
+      // Wait before checking the price again
+      await sleep(PRICE_CHECK_INTERVAL);
+    } catch (e) {
+      logger.trace({ mint: poolKeys.baseMint.toString(), e }, `Failed to check token price`);
+    }
+  }
+
+  // If the SELL_TIMER has expired without meeting conditions, proceed with sell
+  logger.info(`SELL_TIMER expired, proceeding with sell.`);
+  return true;
+};
+
+// Buy Function with Conditional Mint and Freeze Authority Check
 export async function buy(
   latestBlockhash: string,
   newTokenAccount: PublicKey,
@@ -199,114 +204,124 @@ export async function buy(
 ): Promise<void> {
   try {
     const mintAddress = poolState.baseMint;
-    const shouldCheckFreezeAuthority = process.env.FREEZE_AUTHORITY === 'true';
-
-    if (shouldCheckFreezeAuthority) {
-      const freezeAuthorityExists = await checkFreezeAuthority(mintAddress);
-      // Skip buying if freeze authority exists
-      if (freezeAuthorityExists) {
-        logger.info(`Freeze authority exists for token mint: ${mintAddress.toString()} Skipping buy.`);
-        return; 
-      }
-
-      logger.info(`No freeze authority for token mint: ${mintAddress.toString()} Proceeding to buy.`);
-    } else {
-      logger.info(`FREEZE_AUTHORITY is disabled. Skipping freeze authority check and proceeding to buy.`);
+    const shouldCheckFreezeAuthority = FREEZE_AUTHORITY;
+    const shouldCheckMintAuthority = MINT_AUTHORITY;
+    const { mintAuthority, freezeAuthorityExists } = await checkAuthority(mintAddress);
+    
+    // Check freeze authority conditionally based on environment variable
+    if (shouldCheckFreezeAuthority && freezeAuthorityExists) {
+      logger.info(`Freeze authority exists for token mint: ${mintAddress.toString()}, skipping buy.`);
+      return;
     }
+
+    // Check mint authority conditionally based on environment variable
+    if (shouldCheckMintAuthority && mintAuthority) {
+      logger.info(`Mint authority exists for token mint: ${mintAddress.toString()}, skipping buy.`);
+      return;
+    }
+
+    // Log if the authority checks are disabled
+    if (!shouldCheckMintAuthority) {
+      logger.info(`MINT_AUTHORITY check is disabled for token mint: ${mintAddress.toString()}.`);
+    }
+
+    if (!shouldCheckFreezeAuthority) {
+      logger.info(`FREEZE_AUTHORITY check is disabled for token mint: ${mintAddress.toString()}.`);
+    }
+
+    // If both checks are disabled or neither condition exists, proceed with the buy.
+    logger.info(`No blocking authority conditions found or checks are disabled, proceeding with buy.`);
 
     const ata = getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
     const poolKeys = createPoolKeys(newTokenAccount, poolState, minimalMarketLayoutV3);
 
-    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-      {
-        poolKeys: poolKeys,
-        userKeys: {
-          tokenAccountIn: quoteTokenAssociatedAddress,
-          tokenAccountOut: ata,
-          owner: wallet.publicKey,
+    // Determine the number of tokens to buy based on ONE_TOKEN_AT_A_TIME
+    const numTokensToBuy = ONE_TOKEN_AT_A_TIME ? 1 : MAX_NUMBERS_TOKENS_TO_PROCESS;
+
+    for (let i = 0; i < numTokensToBuy; i++) {
+      logger.info(`Buying ${quoteAmount.toFixed()} of ${mintAddress.toString()}...`);
+
+      const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
+        {
+          poolKeys: poolKeys,
+          userKeys: {
+            tokenAccountIn: quoteTokenAssociatedAddress,
+            tokenAccountOut: ata,
+            owner: wallet.publicKey,
+          },
+          amountIn: quoteAmount.raw,
+          minAmountOut: 0,
         },
-        amountIn: quoteAmount.raw,
-        minAmountOut: 0,
-      },
-      poolKeys.version,
-    );
+        poolKeys.version,
+      );
 
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash,
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 60000 }),
-        createAssociatedTokenAccountIdempotentInstruction(
-          wallet.publicKey,
-          ata,
-          wallet.publicKey,
-          mintAddress,
-        ),
-        ...innerTransaction.instructions,
-      ],
-    }).compileToV0Message();
+      const messageV0 = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: latestBlockhash,
+        instructions: [
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
+          createAssociatedTokenAccountIdempotentInstruction(
+            wallet.publicKey,
+            ata,
+            wallet.publicKey,
+            mintAddress,
+          ),
+          ...innerTransaction.instructions,
+        ],
+      }).compileToV0Message();
 
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet, ...innerTransaction.signers]);
+      const transaction = new VersionedTransaction(messageV0);
+      transaction.sign([wallet, ...innerTransaction.signers]);
 
-    const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: true,
-    });
+      const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+      });
 
-    logger.info(`Buy transaction completed with signature - ${signature}`);
-
-    // Auto-sell logic
-    if (AUTO_SELL) {
-      logger.info(`AUTO_SELL is enabled, triggering sell in ${SELL_TIMER} milliseconds...`);
-      setTimeout(async () => {
-        await sell(wallet.publicKey, { mint: mintAddress, address: ata }, poolState, poolKeys);
-      }, SELL_TIMER);
+      logger.info(`Buy transaction completed with signature - ${signature}`);
     }
 
+    // After buy completes, initiate sell if AUTO_SELL is enabled
+    if (AUTO_SELL) {
+      logger.info(`AUTO_SELL is enabled, calling sell function to monitor conditions.`);
+      await sleep(10000); // Wait for 12 seconds before selling
+      await sell(wallet.publicKey, { mint: mintAddress, address: ata }, poolState, poolKeys);
+    }
   } catch (error) {
     logger.error(error);
   }
 }
 
+// Sell function
 export const sell = async (
   accountId: PublicKey,
   rawAccount: MinimalTokenAccountData,
   poolState: LiquidityStateV4,
   poolKeys: LiquidityPoolKeysV4
 ): Promise<void> => {
-  logger.info(`Sell function triggered for account: ${accountId.toString()}`); 
+  logger.info(`Sell function triggered for account: ${accountId.toString()}`);
 
   try {
     logger.info({ mint: rawAccount.mint }, `Processing sell for token...`);
 
     // Get the associated token account for the mint
-    let ata: PublicKey;
-    let tokenAccountInfo: any;
-    const maxRetries = MAX_RETRY;
-    const delayBetweenRetries = 2000; // 2 seconds delay between retries
+    let ata = getAssociatedTokenAddressSync(rawAccount.mint, wallet.publicKey);
+    let tokenAccountInfo;
 
-    ata = getAssociatedTokenAddressSync(rawAccount.mint, wallet.publicKey);
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Loop until the token account is found
+    while (!tokenAccountInfo) {
       try {
         tokenAccountInfo = await getAccount(solanaConnection, ata);
-        break; // Break the loop if fetching the account was successful
       } catch (error) {
         if (error instanceof Error && error.name === 'TokenAccountNotFoundError') {
-          logger.info(`Attempt ${attempt + 1}/${maxRetries}: Associated token account not found, retrying...`);
-          if (attempt === maxRetries - 1) {
-            logger.error(`Max retries reached. Failed to fetch the token account.`);
-            throw error;
-          }
-           // Wait before retrying
-          await new Promise((resolve) => setTimeout(resolve, delayBetweenRetries));
+          logger.info(`Associated token account not found, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 700)); // 0.7 seconds delay
         } else if (error instanceof Error) {
           logger.error(`Unexpected error while fetching token account: ${error.message}`);
           throw error;
         } else {
-          logger.error(`An unknown error occurred: ${String(error)}`);
-          throw error;
+          logger.error(`An unknown error occurred while fetching token account.`);
+          throw new Error("An unknown error occurred while fetching token account.");
         }
       }
     }
@@ -350,40 +365,27 @@ export const sell = async (
     const tokenIn = new Token(TOKEN_PROGRAM_ID, rawAccount.mint, poolState.baseDecimal.toNumber());
     const tokenAmountIn = new TokenAmount(tokenIn, tokenBalance, true); // Use the entire balance
 
-    // Fetch pool info
-    const poolInfo = await Liquidity.fetchInfo({
-      connection: solanaConnection,
-      poolKeys,
-    });
+    // Run priceMatch with SELL_TIMER as the timeout
+    const shouldProceedWithSell = await priceMatch(poolKeys, tokenAmountIn, SELL_TIMER);
 
-    if (poolInfo) {
-      logger.info(`Pool status: ${poolInfo.status.toString()}`);
-      logger.info(`Base decimals: ${poolInfo.baseDecimals}`);
-      logger.info(`Quote decimals: ${poolInfo.quoteDecimals}`);
-      logger.info(`Base reserve: ${poolInfo.baseReserve.toString()}`);
-      logger.info(`Quote reserve: ${poolInfo.quoteReserve.toString()}`);
-      logger.info(`LP supply: ${poolInfo.lpSupply.toString()}`);
-      logger.info(`Trading Open time: ${poolInfo.startTime.toString()}`);
+    if (shouldProceedWithSell) {
+      await swap(
+        poolKeys,
+        ata,
+        quoteTokenAssociatedAddress,
+        tokenIn,
+        quoteToken,
+        tokenAmountIn,
+        wallet,
+        'sell'
+      );
     } else {
-      logger.error('Failed to fetch pool info.');
+      logger.info(`Conditions not met, and SELL_TIMER has expired; proceeding with sell.`);
     }
-
-    // Use poolKeys
-    await swap(
-      poolKeys, 
-      ata, // Use the associated token account (ata) for the swap
-      quoteTokenAssociatedAddress, 
-      tokenIn, 
-      quoteToken, 
-      tokenAmountIn, 
-      wallet, 
-      'sell'
-    );
   } catch (error) {
     logger.error({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
   }
 };
-
 
 // Swap Function
 async function swap(
@@ -396,8 +398,11 @@ async function swap(
   wallet: Keypair,
   direction: 'buy' | 'sell',
 ) {
-  // Convert slippage into a percentage (500 means 0.5%)
-  const slippagePercent = new Percent(Math.round(SLIPPAGE * 10000), 10000); 
+  // Determine slippage percentage based on transaction type
+  const slippagePercent = new Percent(
+    direction === 'buy' ? BUY_SLIPPAGE * 100 : SELL_SLIPPAGE * 100,
+    10000
+  );
 
   // Fetch pool info
   const poolInfo = await Liquidity.fetchInfo({
@@ -434,7 +439,7 @@ async function swap(
     recentBlockhash: latestBlockhash.blockhash,
     instructions: [
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 50000 }),
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
       ...innerTransaction.instructions,
       ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []), // Close account if selling
     ],
