@@ -279,54 +279,59 @@ export async function buy(
     const ata = getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
     const poolKeys = createPoolKeys(newTokenAccount, poolState, minimalMarketLayoutV3);
 
-    const numTokensToBuy = ONE_TOKEN_AT_A_TIME ? 1 : MAX_NUMBERS_TOKENS_TO_PROCESS;
-    for (let i = 0; i < numTokensToBuy; i++) {
-      // Fetch and validate blockhash before creating the transaction
-      const validBlockhash = await fetchAndValidateBlockhash();
+    // Fetch and validate blockhash before creating the transaction
+    let validBlockhash = await fetchAndValidateBlockhash();
 
-      const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-        {
-          poolKeys,
-          userKeys: {
-            tokenAccountIn: quoteTokenAssociatedAddress,
-            tokenAccountOut: ata,
-            owner: wallet.publicKey,
-          },
-          amountIn: quoteAmount.raw,
-          minAmountOut: 0,
-        },
-        poolKeys.version,
-      );
-
-      const messageV0 = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: validBlockhash,
-        instructions: [
-          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
-          ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
-          createAssociatedTokenAccountIdempotentInstruction(
-            wallet.publicKey,
-            ata,
-            wallet.publicKey,
-            mintAddress,
-          ),
-          ...innerTransaction.instructions,
-        ],
-      }).compileToV0Message();
-
-      const transaction = new VersionedTransaction(messageV0);
-      transaction.sign([wallet, ...innerTransaction.signers]);
-
-      const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: true,
-      });
-
-      logger.info(`Buy transaction completed with signature - ${signature}`);
+    // Ensure the provided latestBlockhash is still valid
+    if (latestBlockhash !== validBlockhash) {
+      logger.info("Provided blockhash is no longer valid. Fetching a new blockhash...");
+      validBlockhash = await fetchAndValidateBlockhash(); // Fetch a fresh blockhash
     }
+
+    // Prepare the transaction
+    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
+      {
+        poolKeys,
+        userKeys: {
+          tokenAccountIn: quoteTokenAssociatedAddress,
+          tokenAccountOut: ata,
+          owner: wallet.publicKey,
+        },
+        amountIn: quoteAmount.raw,
+        minAmountOut: 0,
+      },
+      poolKeys.version,
+    );
+
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: validBlockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
+        createAssociatedTokenAccountIdempotentInstruction(
+          wallet.publicKey,
+          ata,
+          wallet.publicKey,
+          mintAddress,
+        ),
+        ...innerTransaction.instructions,
+      ],
+    }).compileToV0Message();
+
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([wallet, ...innerTransaction.signers]);
+
+    // Send the transaction
+    const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+    });
+
+    logger.info(`Buy transaction completed with signature - ${signature}`);
 
     // Trigger auto-sell if enabled
     if (AUTO_SELL) {
-      await sleep(5000); // Shortened wait for faster processing
+      await sleep(3000); // Shortened wait for faster processing
       await sell(wallet.publicKey, { mint: mintAddress, address: ata }, poolState, poolKeys);
     }
   } catch (error) {
@@ -342,7 +347,7 @@ export const sell = async (
   poolKeys: LiquidityPoolKeysV4
 ): Promise<void> => {
   try {
-    let ata = getAssociatedTokenAddressSync(rawAccount.mint, wallet.publicKey);
+    const ata = getAssociatedTokenAddressSync(rawAccount.mint, wallet.publicKey);
 
     // Attempt to fetch token account info, retry if not found
     let tokenAccountInfo;
@@ -371,16 +376,7 @@ export const sell = async (
     const shouldProceedWithSell = await priceMatch(poolKeys, tokenAmountIn, SELL_TIMER);
 
     if (shouldProceedWithSell) {
-      await swap(
-        poolKeys,
-        ata,
-        quoteTokenAssociatedAddress,
-        tokenIn,
-        quoteToken,
-        tokenAmountIn,
-        wallet,
-        'sell'
-      );
+      await attemptSell(poolKeys, ata, tokenIn, tokenAmountIn);
     } else {
       logger.info(`Conditions not met, skipping sell.`);
     }
@@ -388,6 +384,44 @@ export const sell = async (
     logger.error({ mint: rawAccount.mint.toString(), error }, `Sell operation failed`);
   }
 };
+
+// Function to attempt selling with retry logic
+async function attemptSell(
+  poolKeys: LiquidityPoolKeysV4,
+  ataIn: PublicKey,
+  tokenIn: Token,
+  amountIn: TokenAmount,
+) {
+  const maxRetries = 10; // Maximum number of retry attempts
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const confirmed = await swap(
+        poolKeys,
+        ataIn,
+        quoteTokenAssociatedAddress,
+        tokenIn,
+        quoteToken,
+        amountIn,
+        wallet,
+        'sell'
+      );
+
+      // Check if the transaction was confirmed
+      const isConfirmed = await confirmTransaction(confirmed);
+      if (isConfirmed) {
+        logger.info(`Sell transaction confirmed on attempt ${attempt + 1}`);
+        break; // Exit if confirmed
+      } else {
+        logger.warn(`Sell transaction not confirmed on attempt ${attempt + 1}, retrying...`);
+      }
+    } catch (error) {
+      logger.error({ attempt: attempt + 1, error }, `Sell attempt ${attempt + 1} failed`);
+      if (attempt === maxRetries - 1) {
+        logger.error(`Max retries reached for selling. Aborting.`);
+      }
+    }
+  }
+}
 
 // Optimized Swap Function
 async function swap(
@@ -399,7 +433,7 @@ async function swap(
   amountIn: TokenAmount,
   wallet: Keypair,
   direction: 'buy' | 'sell',
-) {
+): Promise<string> { // Return the transaction signature for confirmation check
   const slippagePercent = new Percent(
     direction === 'buy' ? BUY_SLIPPAGE * 100 : SELL_SLIPPAGE * 100,
     10000
@@ -451,4 +485,17 @@ async function swap(
   });
 
   logger.info(`Transaction ${direction} completed with signature - ${signature}`);
+
+  return signature; // Return the transaction signature for confirmation
+}
+
+// Function to confirm the transaction
+async function confirmTransaction(signature: string): Promise<boolean> {
+  try {
+    const result = await solanaConnection.confirmTransaction(signature);
+    return result.value.err === null; // Check if the transaction is confirmed successfully
+  } catch (error) {
+    logger.error(`Failed to confirm transaction: ${signature}, error: ${error}`);
+    return false; // Return false if confirmation fails
+  }
 }
