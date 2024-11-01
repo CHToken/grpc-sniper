@@ -1,6 +1,7 @@
 // External Libraries
 import bs58 from 'bs58';
 import { BN } from 'bn.js';
+import fetch from 'node-fetch';
 import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Token, TokenAmount, Percent } from '@raydium-io/raydium-sdk';
 import { createAssociatedTokenAccountIdempotentInstruction, createCloseAccountInstruction, getAccount, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from '@solana/spl-token';
@@ -43,112 +44,131 @@ export async function init(): Promise<void> {
   logger.info(`Wallet Address: ${wallet.publicKey}`);
 
   // Handle quote token based on QUOTE_MINT (WSOL or USDC)
-  switch (QUOTE_MINT) {
-    case 'WSOL': {
-      quoteToken = Token.WSOL;
-      quoteAmount = new TokenAmount(Token.WSOL, QUOTE_AMOUNT, false);
-      logger.info('Quote token is WSOL');
-      break;
-    }
-    case 'USDC': {
-      quoteToken = new Token(
-        TOKEN_PROGRAM_ID,
-        new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
-        6,
-        'USDC',
-        'USDC',
-      );
-      quoteAmount = new TokenAmount(quoteToken, QUOTE_AMOUNT, false);
-      logger.info('Quote token is USDC');
-      break;
-    }
-    default: {
-      throw new Error(`Unsupported quote mint "${QUOTE_MINT}". Supported values are USDC and WSOL`);
-    }
+  if (QUOTE_MINT === 'WSOL') {
+    quoteToken = Token.WSOL;
+    quoteAmount = new TokenAmount(Token.WSOL, QUOTE_AMOUNT, false);
+    logger.info('Quote token is WSOL');
+  } else if (QUOTE_MINT === 'USDC') {
+    quoteToken = new Token(
+      TOKEN_PROGRAM_ID,
+      new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
+      6,
+      'USDC',
+      'USDC',
+    );
+    quoteAmount = new TokenAmount(quoteToken, QUOTE_AMOUNT, false);
+    logger.info('Quote token is USDC');
+  } else {
+    throw new Error(`Unsupported quote mint "${QUOTE_MINT}". Supported values are USDC and WSOL`);
   }
 
   logger.info(
-    `Script will buy all new tokens using ${QUOTE_MINT}. Amount that will be used to buy each token is: ${quoteAmount.toFixed().toString()}`
+    `Script will buy all new tokens using ${QUOTE_MINT}. Amount for each token: ${quoteAmount.toFixed().toString()}`
   );
 
-  // Trading configurations
-  logger.info(`AUTO_SELL: ${AUTO_SELL}`);
-  logger.info(`BUY_SLIPPAGE: ${BUY_SLIPPAGE}%`);
-  logger.info(`SELL_SLIPPAGE: ${SELL_SLIPPAGE}%`);
-  logger.info(`STOP_LOSS: ${STOP_LOSS}%`);
-  logger.info(`TAKE_PROFIT: ${TAKE_PROFIT}%`);
-  logger.info(`ONE_TOKEN_AT_A_TIME: ${ONE_TOKEN_AT_A_TIME}`);
-  logger.info(`MAX_NUMBERS_TOKENS_TO_PROCESS: ${MAX_NUMBERS_TOKENS_TO_PROCESS}`);
-  logger.info(`AMOUNT_TO_WSOL: ${AMOUNT_TO_WSOL}`);
-  logger.info(`QUOTE_AMOUNT: ${QUOTE_AMOUNT}`);
-  logger.info(`MAX_RETRY: ${MAX_RETRY}`);
-
-  // Timers and intervals
-  logger.info(`SELL_TIMER: ${SELL_TIMER}ms`);
-  logger.info(`PRICE_CHECK_INTERVAL: ${PRICE_CHECK_INTERVAL}ms`);
-
-  // Authorities
-  logger.info(`FREEZE_AUTHORITY: ${FREEZE_AUTHORITY}`);
-  logger.info(`MINT_AUTHORITY: ${MINT_AUTHORITY}`);
+  // Log trading configurations
+  logger.info(`
+    AUTO_SELL: ${AUTO_SELL}
+    BUY_SLIPPAGE: ${BUY_SLIPPAGE}%
+    SELL_SLIPPAGE: ${SELL_SLIPPAGE}%
+    STOP_LOSS: ${STOP_LOSS}%
+    TAKE_PROFIT: ${TAKE_PROFIT}%
+    ONE_TOKEN_AT_A_TIME: ${ONE_TOKEN_AT_A_TIME}
+    MAX_NUMBERS_TOKENS_TO_PROCESS: ${MAX_NUMBERS_TOKENS_TO_PROCESS}
+    AMOUNT_TO_WSOL: ${AMOUNT_TO_WSOL} ${quoteToken.symbol}
+    QUOTE_AMOUNT: ${QUOTE_AMOUNT} ${quoteToken.symbol}
+    MAX_RETRY: ${MAX_RETRY}
+    SELL_TIMER: ${SELL_TIMER}ms
+    PRICE_CHECK_INTERVAL: ${PRICE_CHECK_INTERVAL}ms
+    FREEZE_AUTHORITY: ${FREEZE_AUTHORITY}
+    MINT_AUTHORITY: ${MINT_AUTHORITY}
+  `);
 
   // Check existing wallet for associated token account of quote mint
   const tokenAccounts = await getTokenAccounts(solanaConnection, wallet.publicKey, COMMITMENT_LEVEL);
   logger.info('Fetched token accounts from wallet.');
 
-  // Create WSOL ATA and fund it with SOL during initialization
   if (QUOTE_MINT === 'WSOL') {
     const wsolAta = getAssociatedTokenAddressSync(Token.WSOL.mint, wallet.publicKey);
     logger.info(`WSOL ATA: ${wsolAta.toString()}`);
 
-    // Check if WSOL account exists in wallet
-    const solAccount = tokenAccounts.find(
-      (acc) => acc.accountInfo.mint.toString() === Token.WSOL.mint.toString()
-    );
-
+    const solAccount = tokenAccounts.find(acc => acc.accountInfo.mint.toString() === Token.WSOL.mint.toString());
     if (!solAccount) {
-      logger.info(`No WSOL token account found. Creating and funding with ` + `${AMOUNT_TO_WSOL} SOL...`);
-
-      // Create WSOL (wrapped SOL) account and fund it with SOL
+      logger.info(`No WSOL token account found. Creating and funding with ${AMOUNT_TO_WSOL} SOL...`);
       await createAndFundWSOL(wsolAta);
     } else {
       logger.info('WSOL account already exists in the wallet.');
-
-      // Fetch the WSOL account balance
       const wsolAccountInfo = await getAccount(solanaConnection, wsolAta);
+
       const wsolBalance = Number(wsolAccountInfo.amount) / LAMPORTS_PER_SOL;
       logger.info(`Current WSOL balance: ${wsolBalance} WSOL`);
 
-      // If WSOL balance is less than AMOUNT_TO_WSOL, top up the WSOL account
       if (wsolBalance < AMOUNT_TO_WSOL) {
-        logger.info(`Insufficient WSOL balance. Funding with additional ` + `${AMOUNT_TO_WSOL} +  SOL...`);
+        logger.info(`Insufficient WSOL balance. Funding with additional ${AMOUNT_TO_WSOL} SOL...`);
         await createAndFundWSOL(wsolAta);
       }
     }
-
-    // Set the quote token associated address
     quoteTokenAssociatedAddress = wsolAta;
   } else {
-    const tokenAccount = tokenAccounts.find(
-      (acc) => acc.accountInfo.mint.toString() === quoteToken.mint.toString()
-    );
-
+    const tokenAccount = tokenAccounts.find(acc => acc.accountInfo.mint.toString() === quoteToken.mint.toString());
     if (!tokenAccount) {
       throw new Error(`No ${quoteToken.symbol} token account found in wallet: ${wallet.publicKey}`);
     }
-
     quoteTokenAssociatedAddress = tokenAccount.pubkey;
   }
 }
 
+// Constants for rate limiting
+const RATE_LIMIT_INTERVAL = 2000; // 2000 milliseconds for 30 calls per minute
+let lastFetchTime = 0; // Timestamp of the last fetch
+
+// Function to fetch WSOL price from CoinGecko with retry logic
+const fetchWsolPrice = async (retries: number = 3, delay: number = 2000): Promise<number | null> => {
+    for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+            const now = Date.now();
+            // Check if we need to wait before making the next API call
+            if (now - lastFetchTime < RATE_LIMIT_INTERVAL) {
+                await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_INTERVAL - (now - lastFetchTime)));
+            }
+            lastFetchTime = Date.now(); // Update last fetch time
+            
+            const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=wrapped-solana&vs_currencies=usd');
+            const data: { [key: string]: { usd: number } } = await response.json() as { [key: string]: { usd: number } };
+
+            // Accessing the WSOL price from the response format
+            if (data['wrapped-solana'] && data['wrapped-solana'].usd) {
+                return data['wrapped-solana'].usd; // Return the WSOL price in USD
+            } else {
+                throw new Error('Failed to retrieve WSOL price from CoinGecko');
+            }
+        } catch (error) {
+            logger.error(`Attempt ${attempt + 1} - Error fetching WSOL price:`, error);
+            // Wait before retrying
+            if (attempt < retries - 1) {
+                await new Promise(resolve => setTimeout(resolve, delay)); // Delay before retrying
+            }
+        }
+    }
+    logger.error('Failed to fetch WSOL price after multiple attempts.');
+    return null; // Return null if all attempts fail
+};
 
 const priceMatch = async (poolKeys: LiquidityPoolKeysV4, amountIn: TokenAmount, sellTimer: number) => {
   if (PRICE_CHECK_INTERVAL === 0) {
-    return true; // Immediately proceed if no interval is set
+      return true; // Immediately proceed if no interval is set
+  }
+
+  const wsolPriceInUsd = await fetchWsolPrice();
+  if (!wsolPriceInUsd) {
+      logger.error('Could not fetch WSOL price, exiting price match.');
+      return false; // Exit if the price couldn't be fetched
   }
 
   const profitFraction = quoteAmount.mul(TAKE_PROFIT).numerator.div(new BN(100));
   const profitAmount = new TokenAmount(quoteToken, profitFraction, true);
-  const takeProfit = quoteAmount.add(profitAmount);
+  let takeProfit = quoteAmount.add(profitAmount);
+  const initialTakeProfitInUsd = parseFloat(takeProfit.toFixed()) * wsolPriceInUsd;
 
   const lossFraction = quoteAmount.mul(STOP_LOSS).numerator.div(new BN(100));
   const lossAmount = new TokenAmount(quoteToken, lossFraction, true);
@@ -156,38 +176,60 @@ const priceMatch = async (poolKeys: LiquidityPoolKeysV4, amountIn: TokenAmount, 
   const slippage = new Percent(SELL_SLIPPAGE, 100);
 
   let startTime = Date.now();
+  let highestPrice = 0;
 
   // Loop until the SELL_TIMER duration elapses or price conditions are met
   while (Date.now() - startTime < sellTimer) {
-    try {
-      const poolInfo = await Liquidity.fetchInfo({
-        connection: solanaConnection,
-        poolKeys,
-      });
+      try {
+          const poolInfo = await Liquidity.fetchInfo({
+              connection: solanaConnection,
+              poolKeys,
+          });
 
-      const amountOut = Liquidity.computeAmountOut({
-        poolKeys,
-        poolInfo,
-        amountIn: amountIn,
-        currencyOut: quoteToken,
-        slippage,
-      }).amountOut;
+          const amountOut = Liquidity.computeAmountOut({
+              poolKeys,
+              poolInfo,
+              amountIn: amountIn,
+              currencyOut: quoteToken,
+              slippage,
+          }).amountOut;
 
-      logger.debug(
-        { mint: poolKeys.baseMint.toString() },
-        `Take profit: ${takeProfit.toFixed()} | Stop loss: ${stopLoss.toFixed()} | Current: ${amountOut.toFixed()}`
-      );
+          // Ensure amounts are treated as numbers for arithmetic operations
+          const currentInUsd = parseFloat(amountOut.toFixed()) * wsolPriceInUsd;
 
-      // Check if the price meets the take profit or stop loss conditions
-      if (amountOut.lt(stopLoss) || amountOut.gt(takeProfit)) {
-        return true; // Sell conditions met, proceed to sell
+          // Check if the current price is a new high
+          if (currentInUsd > highestPrice) {
+              highestPrice = currentInUsd; // Update highest price seen
+              // Lock in profit by adjusting take profit to current level + profit fraction
+              const newTakeProfit = currentInUsd * (1 + (TAKE_PROFIT / 100));
+              takeProfit = new TokenAmount(quoteToken, newTakeProfit / wsolPriceInUsd, true); // Update take profit
+              logger.info(`New take profit level locked in at: $${newTakeProfit.toFixed(2)}`);
+          }
+
+          const takeProfitInUsd = parseFloat(takeProfit.toFixed()) * wsolPriceInUsd;
+          const stopLossInUsd = parseFloat(stopLoss.toFixed()) * wsolPriceInUsd;
+
+          // Calculate gain percentage based on the take profit
+          const gainPercentage = ((currentInUsd - initialTakeProfitInUsd) / initialTakeProfitInUsd) * 100;
+
+          // Format gain percentage to show '+' or '-' sign
+          const formattedGainPercentage = gainPercentage >= 0 ? `+${gainPercentage.toFixed(2)}%` : `${gainPercentage.toFixed(2)}%`;
+
+          logger.debug(
+              { mint: poolKeys.baseMint.toString() },
+              `Take profit: $${takeProfitInUsd.toFixed(2)} | Stop loss: $${stopLossInUsd.toFixed(2)} | Current: $${currentInUsd.toFixed(2)} | Gain Percentage: ${formattedGainPercentage}`
+          );
+
+          // Check if the price meets the take profit or stop loss conditions
+          if (amountOut.lt(stopLoss) || amountOut.gt(takeProfit)) {
+              return true; // Sell conditions met, proceed to sell
+          }
+
+          // Wait before checking the price again
+          await sleep(PRICE_CHECK_INTERVAL);
+      } catch (e) {
+          logger.trace({ mint: poolKeys.baseMint.toString(), e }, `Failed to check token price`);
       }
-
-      // Wait before checking the price again
-      await sleep(PRICE_CHECK_INTERVAL);
-    } catch (e) {
-      logger.trace({ mint: poolKeys.baseMint.toString(), e }, `Failed to check token price`);
-    }
   }
 
   // If the SELL_TIMER has expired without meeting conditions, proceed with sell
@@ -195,7 +237,23 @@ const priceMatch = async (poolKeys: LiquidityPoolKeysV4, amountIn: TokenAmount, 
   return true;
 };
 
-// Buy Function with Conditional Mint and Freeze Authority Check
+async function fetchAndValidateBlockhash(): Promise<string> {
+  try {
+    const { blockhash, lastValidBlockHeight } = await solanaConnection.getLatestBlockhash();
+    const currentBlockHeight = await solanaConnection.getBlockHeight();
+    // Check if the current block height is within the valid range
+    if (currentBlockHeight > lastValidBlockHeight) {
+      throw new Error("Blockhash is no longer valid");
+    }
+
+    return blockhash;
+  } catch (error) {
+    logger.error("Failed to fetch latest blockhash", error);
+    throw new Error("Invalid blockhash");
+  }
+}
+
+// Buy Function with Optimized Mint and Freeze Authority Check
 export async function buy(
   latestBlockhash: string,
   newTokenAccount: PublicKey,
@@ -206,44 +264,29 @@ export async function buy(
     const mintAddress = poolState.baseMint;
     const shouldCheckFreezeAuthority = FREEZE_AUTHORITY;
     const shouldCheckMintAuthority = MINT_AUTHORITY;
-    const { mintAuthority, freezeAuthorityExists } = await checkAuthority(mintAddress);
-    
-    // Check freeze authority conditionally based on environment variable
-    if (shouldCheckFreezeAuthority && freezeAuthorityExists) {
-      logger.info(`Freeze authority exists for token mint: ${mintAddress.toString()}, skipping buy.`);
-      return;
-    }
 
-    // Check mint authority conditionally based on environment variable
-    if (shouldCheckMintAuthority && mintAuthority) {
-      logger.info(`Mint authority exists for token mint: ${mintAddress.toString()}, skipping buy.`);
-      return;
-    }
+    // Check authority only if required
+    if (shouldCheckFreezeAuthority || shouldCheckMintAuthority) {
+      const { mintAuthority, freezeAuthorityExists } = await checkAuthority(mintAddress);
 
-    // Log if the authority checks are disabled
-    if (!shouldCheckMintAuthority) {
-      logger.info(`MINT_AUTHORITY check is disabled for token mint: ${mintAddress.toString()}.`);
+      if ((shouldCheckFreezeAuthority && freezeAuthorityExists) ||
+          (shouldCheckMintAuthority && mintAuthority)) {
+        logger.info(`Authority conditions prevent buy for mint: ${mintAddress.toString()}`);
+        return;
+      }
     }
-
-    if (!shouldCheckFreezeAuthority) {
-      logger.info(`FREEZE_AUTHORITY check is disabled for token mint: ${mintAddress.toString()}.`);
-    }
-
-    // If both checks are disabled or neither condition exists, proceed with the buy.
-    logger.info(`No blocking authority conditions found or checks are disabled, proceeding with buy.`);
 
     const ata = getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
     const poolKeys = createPoolKeys(newTokenAccount, poolState, minimalMarketLayoutV3);
 
-    // Determine the number of tokens to buy based on ONE_TOKEN_AT_A_TIME
     const numTokensToBuy = ONE_TOKEN_AT_A_TIME ? 1 : MAX_NUMBERS_TOKENS_TO_PROCESS;
-
     for (let i = 0; i < numTokensToBuy; i++) {
-      logger.info(`Buying ${quoteAmount.toFixed()} of ${mintAddress.toString()}...`);
+      // Fetch and validate blockhash before creating the transaction
+      const validBlockhash = await fetchAndValidateBlockhash();
 
       const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
         {
-          poolKeys: poolKeys,
+          poolKeys,
           userKeys: {
             tokenAccountIn: quoteTokenAssociatedAddress,
             tokenAccountOut: ata,
@@ -257,7 +300,7 @@ export async function buy(
 
       const messageV0 = new TransactionMessage({
         payerKey: wallet.publicKey,
-        recentBlockhash: latestBlockhash,
+        recentBlockhash: validBlockhash,
         instructions: [
           ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
           ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
@@ -281,10 +324,9 @@ export async function buy(
       logger.info(`Buy transaction completed with signature - ${signature}`);
     }
 
-    // After buy completes, initiate sell if AUTO_SELL is enabled
+    // Trigger auto-sell if enabled
     if (AUTO_SELL) {
-      logger.info(`AUTO_SELL is enabled, calling sell function to monitor conditions.`);
-      await sleep(10000); // Wait for 12 seconds before selling
+      await sleep(5000); // Shortened wait for faster processing
       await sell(wallet.publicKey, { mint: mintAddress, address: ata }, poolState, poolKeys);
     }
   } catch (error) {
@@ -292,80 +334,40 @@ export async function buy(
   }
 }
 
-// Sell function
+// Sell Function
 export const sell = async (
   accountId: PublicKey,
   rawAccount: MinimalTokenAccountData,
   poolState: LiquidityStateV4,
   poolKeys: LiquidityPoolKeysV4
 ): Promise<void> => {
-  logger.info(`Sell function triggered for account: ${accountId.toString()}`);
-
   try {
-    logger.info({ mint: rawAccount.mint }, `Processing sell for token...`);
-
-    // Get the associated token account for the mint
     let ata = getAssociatedTokenAddressSync(rawAccount.mint, wallet.publicKey);
-    let tokenAccountInfo;
 
-    // Loop until the token account is found
+    // Attempt to fetch token account info, retry if not found
+    let tokenAccountInfo;
     while (!tokenAccountInfo) {
       try {
         tokenAccountInfo = await getAccount(solanaConnection, ata);
       } catch (error) {
         if (error instanceof Error && error.name === 'TokenAccountNotFoundError') {
-          logger.info(`Associated token account not found, retrying...`);
-          await new Promise(resolve => setTimeout(resolve, 700)); // 0.7 seconds delay
-        } else if (error instanceof Error) {
-          logger.error(`Unexpected error while fetching token account: ${error.message}`);
-          throw error;
+          await sleep(500); // Reduce retry delay for faster checks
         } else {
-          logger.error(`An unknown error occurred while fetching token account.`);
-          throw new Error("An unknown error occurred while fetching token account.");
+          throw error;
         }
       }
     }
 
-    // If tokenAccountInfo is still undefined after retries, create the associated token account
-    if (!tokenAccountInfo) {
-      logger.info(`Creating associated token account for mint: ${rawAccount.mint.toString()}...`);
-      const transaction = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: (await solanaConnection.getLatestBlockhash()).blockhash,
-        instructions: [
-          createAssociatedTokenAccountIdempotentInstruction(
-            wallet.publicKey,
-            ata,
-            wallet.publicKey,
-            rawAccount.mint,
-          ),
-        ],
-      }).compileToV0Message();
-
-      const createAtaTx = new VersionedTransaction(transaction);
-      createAtaTx.sign([wallet]);
-
-      const signature = await solanaConnection.sendRawTransaction(createAtaTx.serialize());
-      await solanaConnection.confirmTransaction(signature);
-      logger.info(`Created associated token account with signature: ${signature}`);
-
-      // Fetch the newly created token account
-      tokenAccountInfo = await getAccount(solanaConnection, ata);
-    }
-
-    // Fetch the token balance after ensuring the account exists
     const tokenBalance = tokenAccountInfo.amount.toString();
-    logger.info(`Token balance for ${rawAccount.mint.toString()} is: ${tokenBalance}`);
-
     if (tokenBalance === '0') {
-      logger.info({ mint: rawAccount.mint.toString() }, `Empty balance, can't sell`);
+      logger.info({ mint: rawAccount.mint.toString() }, `No balance to sell`);
       return;
     }
 
     const tokenIn = new Token(TOKEN_PROGRAM_ID, rawAccount.mint, poolState.baseDecimal.toNumber());
-    const tokenAmountIn = new TokenAmount(tokenIn, tokenBalance, true); // Use the entire balance
+    const tokenAmountIn = new TokenAmount(tokenIn, tokenBalance, true);
 
-    // Run priceMatch with SELL_TIMER as the timeout
+    // Run price match with SELL_TIMER timeout
     const shouldProceedWithSell = await priceMatch(poolKeys, tokenAmountIn, SELL_TIMER);
 
     if (shouldProceedWithSell) {
@@ -380,37 +382,31 @@ export const sell = async (
         'sell'
       );
     } else {
-      logger.info(`Conditions not met, and SELL_TIMER has expired; proceeding with sell.`);
+      logger.info(`Conditions not met, skipping sell.`);
     }
   } catch (error) {
-    logger.error({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
+    logger.error({ mint: rawAccount.mint.toString(), error }, `Sell operation failed`);
   }
 };
 
-// Swap Function
+// Optimized Swap Function
 async function swap(
   poolKeys: LiquidityPoolKeysV4,
-  ataIn: PublicKey, // Token you're selling
-  ataOut: PublicKey, // Token you're receiving (quoteToken)
+  ataIn: PublicKey,
+  ataOut: PublicKey,
   tokenIn: Token,
   tokenOut: Token,
   amountIn: TokenAmount,
   wallet: Keypair,
   direction: 'buy' | 'sell',
 ) {
-  // Determine slippage percentage based on transaction type
   const slippagePercent = new Percent(
     direction === 'buy' ? BUY_SLIPPAGE * 100 : SELL_SLIPPAGE * 100,
     10000
   );
 
-  // Fetch pool info
-  const poolInfo = await Liquidity.fetchInfo({
-    connection: solanaConnection,
-    poolKeys,
-  });
+  const poolInfo = await Liquidity.fetchInfo({ connection: solanaConnection, poolKeys });
 
-  // Compute the minimum amount out (taking slippage into account)
   const computedAmountOut = Liquidity.computeAmountOut({
     poolKeys,
     poolInfo,
@@ -419,10 +415,12 @@ async function swap(
     slippage: slippagePercent,
   });
 
-  const latestBlockhash = await solanaConnection.getLatestBlockhash();
+  // Fetch and validate blockhash before creating the transaction
+  const validBlockhash = await fetchAndValidateBlockhash();
+
   const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
     {
-      poolKeys: poolKeys,
+      poolKeys,
       userKeys: {
         tokenAccountIn: ataIn,
         tokenAccountOut: ataOut,
@@ -436,16 +434,15 @@ async function swap(
 
   const messageV0 = new TransactionMessage({
     payerKey: wallet.publicKey,
-    recentBlockhash: latestBlockhash.blockhash,
+    recentBlockhash: validBlockhash,
     instructions: [
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 80000 }),
       ...innerTransaction.instructions,
-      ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []), // Close account if selling
+      ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []),
     ],
   }).compileToV0Message();
 
-  // Sign and execute the transaction
   const transaction = new VersionedTransaction(messageV0);
   transaction.sign([wallet, ...innerTransaction.signers]);
 
@@ -453,5 +450,5 @@ async function swap(
     skipPreflight: true,
   });
 
-  logger.info(`Transaction ${direction} with signature - ${signature}`);
+  logger.info(`Transaction ${direction} completed with signature - ${signature}`);
 }
